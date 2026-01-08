@@ -105,7 +105,7 @@ func handleConnection(conn net.Conn, proxy *ProxyServer) {
 	
 	// Check if it looks like HTTP
 	isHTTP := false
-	httpMethods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS", "PATCH", "CONNECT", "TRACE"}
+	httpMethods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT ", "TRACE "}
 	bufStr := string(buf[:n])
 	for _, method := range httpMethods {
 		if strings.HasPrefix(bufStr, method) {
@@ -531,7 +531,8 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 	log.Printf("[MTProto] Connection established [Instance: %s]", instanceID)
 	
 	// Bidirectional copy with obfuscation
-	done := make(chan bool, 2)
+	// Use channels to coordinate goroutine cleanup
+	errChan := make(chan error, 2)
 	
 	// Client -> DC
 	go func() {
@@ -539,7 +540,8 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 		for {
 			n, err := clientConn.Read(buffer)
 			if err != nil {
-				break
+				errChan <- err
+				return
 			}
 			
 			// Apply obfuscation
@@ -548,10 +550,10 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 			obfuscateData(data, secretBytes)
 			
 			if _, err := dcConn.Write(data); err != nil {
-				break
+				errChan <- err
+				return
 			}
 		}
-		done <- true
 	}()
 	
 	// DC -> Client
@@ -560,7 +562,8 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 		for {
 			n, err := dcConn.Read(buffer)
 			if err != nil {
-				break
+				errChan <- err
+				return
 			}
 			
 			// Apply obfuscation
@@ -569,12 +572,17 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 			obfuscateData(data, secretBytes)
 			
 			if _, err := clientConn.Write(data); err != nil {
-				break
+				errChan <- err
+				return
 			}
 		}
-		done <- true
 	}()
 	
-	<-done
+	// Wait for first error (one direction closing)
+	<-errChan
+	// Connection close in defer will terminate the other goroutine
+	// Wait for second goroutine to exit
+	<-errChan
+	
 	log.Printf("[MTProto] Connection closed [Instance: %s]", instanceID)
 }
