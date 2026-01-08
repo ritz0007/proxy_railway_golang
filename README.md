@@ -141,8 +141,6 @@ This server supports both, so you can use it for Telegram AND as a regular web p
 
 ### Using as HTTP/HTTPS Proxy
 
-### Using as HTTP/HTTPS Proxy
-
 #### Without Authentication
 
 ```bash

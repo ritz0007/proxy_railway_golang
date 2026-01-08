@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
@@ -55,14 +57,6 @@ func main() {
 		password: proxyPass,
 	}
 
-	server := &http.Server{
-		Addr:         ":" + port,
-		Handler:      proxy,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
 	// Print startup information
 	log.Printf("🚀 Proxy server [Instance: %s] starting on port %s", instanceID, port)
 	if proxyUser != "" {
@@ -73,13 +67,121 @@ func main() {
 	
 	// Print MTProto connection information
 	printMTProtoConnectionInfo(port)
-	
-	// Start MTProto proxy in a separate goroutine
-	go startMTProtoProxy(port)
 
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	// Create a custom listener that can handle both HTTP and MTProto
+	listener, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		log.Fatalf("Failed to start listener: %v", err)
 	}
+	defer listener.Close()
+
+	log.Printf("✅ Server ready and listening on port %s", port)
+
+	// Accept connections and route based on protocol
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Failed to accept connection: %v", err)
+			continue
+		}
+		
+		go handleConnection(conn, proxy)
+	}
+}
+
+// handleConnection detects the protocol and routes to appropriate handler
+func handleConnection(conn net.Conn, proxy *ProxyServer) {
+	// Don't defer close here - let the handlers close it
+	
+	// Peek at the first few bytes to detect protocol
+	// HTTP starts with method name (GET, POST, CONNECT, etc.)
+	// MTProto has a different handshake pattern
+	buf := make([]byte, 8)
+	n, err := conn.Read(buf)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	
+	// Check if it looks like HTTP
+	isHTTP := false
+	httpMethods := []string{"GET ", "POST", "PUT ", "DELE", "HEAD", "OPTI", "PATC", "CONN", "TRAC"}
+	bufStr := string(buf[:n])
+	for _, method := range httpMethods {
+		if strings.HasPrefix(bufStr, method) {
+			isHTTP = true
+			break
+		}
+	}
+	
+	if isHTTP {
+		// Handle as HTTP - we need to wrap the connection with the already-read bytes
+		handleHTTPConnection(conn, buf[:n], proxy)
+	} else {
+		// Handle as MTProto
+		handleMTProtoConnectionWithBuffer(conn, buf[:n])
+	}
+}
+
+// handleHTTPConnection handles HTTP connections through the proxy server
+func handleHTTPConnection(conn net.Conn, initialData []byte, proxy *ProxyServer) {
+	defer conn.Close()
+	
+	// Create a buffer that prepends the initial data
+	reader := io.MultiReader(bytes.NewReader(initialData), conn)
+	bufReader := bufio.NewReader(reader)
+	
+	// Read the HTTP request
+	req, err := http.ReadRequest(bufReader)
+	if err != nil {
+		log.Printf("Failed to read HTTP request: %v", err)
+		return
+	}
+	
+	// Create a response writer that writes to the connection
+	w := &connResponseWriter{
+		conn:   conn,
+		header: make(http.Header),
+	}
+	
+	// Handle the request using our proxy handler
+	proxy.ServeHTTP(w, req)
+}
+
+// connResponseWriter implements http.ResponseWriter for raw connections
+type connResponseWriter struct {
+	conn          net.Conn
+	header        http.Header
+	statusCode    int
+	wroteHeader   bool
+}
+
+func (w *connResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *connResponseWriter) WriteHeader(statusCode int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.statusCode = statusCode
+	
+	// Write status line
+	fmt.Fprintf(w.conn, "HTTP/1.1 %d %s\r\n", statusCode, http.StatusText(statusCode))
+	
+	// Write headers
+	w.header.Write(w.conn)
+	
+	// Write empty line to end headers
+	fmt.Fprintf(w.conn, "\r\n")
+}
+
+func (w *connResponseWriter) Write(data []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.conn.Write(data)
 }
 
 // printMTProtoConnectionInfo prints the Telegram connection details
@@ -103,15 +205,6 @@ func printMTProtoConnectionInfo(port string) {
 		log.Printf("📱 Telegram Connection Format: https://t.me/proxy?server=<your-domain>&port=443&secret=%s", mtprotoSecret)
 	}
 	log.Println(strings.Repeat("=", 80) + "\n")
-}
-
-// startMTProtoProxy starts the MTProto proxy server
-func startMTProtoProxy(httpPort string) {
-	// MTProto runs on the same port as HTTP - we'll detect the protocol from the handshake
-	// For now, we'll start a TCP listener that can handle both HTTP and MTProto
-	// The HTTP server already listens on the port, so MTProto will be handled via raw TCP detection
-	
-	log.Printf("[MTProto] MTProto proxy handler initialized (shares port with HTTP)")
 }
 
 type ProxyServer struct {
@@ -381,6 +474,112 @@ var telegramDCs = []string{
 	"149.154.171.5:443",
 }
 
+// handleMTProtoConnectionWithBuffer handles MTProto connection with initial buffered data
+func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) {
+	defer clientConn.Close()
+	
+	atomic.AddInt64(&activeConnections, 1)
+	defer atomic.AddInt64(&activeConnections, -1)
+	
+	// Read the rest of the handshake (first 64 bytes contain protocol info)
+	handshake := make([]byte, 64)
+	copy(handshake, initialData)
+	
+	remaining := 64 - len(initialData)
+	if remaining > 0 {
+		n, err := io.ReadFull(clientConn, handshake[len(initialData):])
+		if err != nil || n != remaining {
+			log.Printf("[MTProto] Failed to read handshake: %v", err)
+			return
+		}
+	}
+	
+	// Decode the handshake with our secret
+	secretBytes, err := hex.DecodeString(mtprotoSecret)
+	if err != nil {
+		log.Printf("[MTProto] Failed to decode secret: %v", err)
+		return
+	}
+	
+	// Apply obfuscation to handshake
+	for i := 0; i < 64 && i < len(secretBytes); i++ {
+		handshake[i] ^= secretBytes[i%len(secretBytes)]
+	}
+	
+	// Try to connect to Telegram DC (use the first one as default)
+	dcConn, err := net.DialTimeout("tcp", telegramDCs[0], 30*time.Second)
+	if err != nil {
+		log.Printf("[MTProto] Failed to connect to Telegram DC: %v", err)
+		return
+	}
+	defer dcConn.Close()
+	
+	// Re-encode handshake for Telegram DC
+	for i := 0; i < 64 && i < len(secretBytes); i++ {
+		handshake[i] ^= secretBytes[i%len(secretBytes)]
+	}
+	
+	// Send handshake to Telegram
+	if _, err := dcConn.Write(handshake); err != nil {
+		log.Printf("[MTProto] Failed to send handshake to DC: %v", err)
+		return
+	}
+	
+	log.Printf("[MTProto] Connection established [Instance: %s]", instanceID)
+	
+	// Bidirectional copy with obfuscation
+	done := make(chan bool, 2)
+	
+	// Client -> DC
+	go func() {
+		buffer := make([]byte, 32768)
+		for {
+			n, err := clientConn.Read(buffer)
+			if err != nil {
+				break
+			}
+			
+			// Apply obfuscation
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+			for i := 0; i < n && i < len(secretBytes); i++ {
+				data[i] ^= secretBytes[i%len(secretBytes)]
+			}
+			
+			if _, err := dcConn.Write(data); err != nil {
+				break
+			}
+		}
+		done <- true
+	}()
+	
+	// DC -> Client
+	go func() {
+		buffer := make([]byte, 32768)
+		for {
+			n, err := dcConn.Read(buffer)
+			if err != nil {
+				break
+			}
+			
+			// Apply obfuscation
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+			for i := 0; i < n && i < len(secretBytes); i++ {
+				data[i] ^= secretBytes[i%len(secretBytes)]
+			}
+			
+			if _, err := clientConn.Write(data); err != nil {
+				break
+			}
+		}
+		done <- true
+	}()
+	
+	<-done
+	log.Printf("[MTProto] Connection closed [Instance: %s]", instanceID)
+}
+
 // handleMTProtoConnection handles an MTProto proxy connection
 func handleMTProtoConnection(clientConn net.Conn) {
 	defer clientConn.Close()
@@ -397,7 +596,11 @@ func handleMTProtoConnection(clientConn net.Conn) {
 	}
 	
 	// Decode the handshake with our secret
-	secretBytes, _ := hex.DecodeString(mtprotoSecret)
+	secretBytes, err := hex.DecodeString(mtprotoSecret)
+	if err != nil {
+		log.Printf("[MTProto] Failed to decode secret: %v", err)
+		return
+	}
 	for i := 0; i < 64 && i < len(secretBytes); i++ {
 		handshake[i] ^= secretBytes[i%len(secretBytes)]
 	}
