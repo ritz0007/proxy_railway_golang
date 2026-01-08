@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -21,25 +20,27 @@ var (
 	activeConnections int64
 	totalRequests     int64
 	instanceID        string
-	mtprotoSecret     string
+	socks5Username    string
+	socks5Password    string
 )
 
 func init() {
 	// Generate unique instance ID for multi-instance tracking
 	hostname, _ := os.Hostname()
 	instanceID = fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano()%10000)
-	
-	// Generate unique MTProto secret for this instance
-	mtprotoSecret = generateMTProtoSecret()
 }
 
-// generateMTProtoSecret generates a random 32-byte (64 hex char) secret for MTProto
-func generateMTProtoSecret() string {
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		log.Fatalf("Failed to generate MTProto secret: %v", err)
+// generateRandomString generates a random alphanumeric string of given length
+func generateRandomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("Failed to generate random string: %v", err)
 	}
-	return hex.EncodeToString(secret)
+	for i := range b {
+		b[i] = charset[b[i]%byte(len(charset))]
+	}
+	return string(b)
 }
 
 func main() {
@@ -48,25 +49,27 @@ func main() {
 		port = "8080"
 	}
 
-	// Optional authentication
-	proxyUser := os.Getenv("PROXY_USER")
-	proxyPass := os.Getenv("PROXY_PASS")
+	// SOCKS5 credentials - use env vars or generate random ones
+	socks5Username = os.Getenv("PROXY_USER")
+	socks5Password = os.Getenv("PROXY_PASS")
+	
+	if socks5Username == "" {
+		socks5Username = generateRandomString(8)
+	}
+	if socks5Password == "" {
+		socks5Password = generateRandomString(16)
+	}
 
 	proxy := &ProxyServer{
-		username: proxyUser,
-		password: proxyPass,
+		username: socks5Username,
+		password: socks5Password,
 	}
 
 	// Print startup information
 	log.Printf("🚀 Proxy server [Instance: %s] starting on port %s", instanceID, port)
-	if proxyUser != "" {
-		log.Println("🔐 Authentication enabled")
-	} else {
-		log.Println("⚠️  Authentication disabled (set PROXY_USER and PROXY_PASS to enable)")
-	}
 	
-	// Print MTProto connection information
-	printMTProtoConnectionInfo(port)
+	// Print SOCKS5 connection information
+	printSOCKS5ConnectionInfo(port)
 
 	// Create a custom listener that can handle both HTTP and MTProto
 	listener, err := net.Listen("tcp", ":"+port)
@@ -93,20 +96,37 @@ func main() {
 func handleConnection(conn net.Conn, proxy *ProxyServer) {
 	// Don't defer close here - let the handlers close it
 	
-	// Peek at the first few bytes to detect protocol
+	// Peek at the first byte to detect protocol
 	// HTTP starts with method name (GET, POST, CONNECT, etc.)
-	// MTProto has a different handshake pattern
-	buf := make([]byte, 8)
+	// SOCKS5 starts with 0x05 (version byte)
+	buf := make([]byte, 1)
 	n, err := conn.Read(buf)
 	if err != nil {
 		conn.Close()
 		return
 	}
 	
+	// Check if it's SOCKS5 (version byte 0x05)
+	if n > 0 && buf[0] == 0x05 {
+		handleSOCKS5Connection(conn, buf[:n], proxy)
+		return
+	}
+	
+	// Check if it looks like HTTP - need more bytes
+	moreBuf := make([]byte, 7)
+	n2, err := conn.Read(moreBuf)
+	if err != nil {
+		conn.Close()
+		return
+	}
+	
+	// Combine buffers
+	fullBuf := append(buf[:n], moreBuf[:n2]...)
+	
 	// Check if it looks like HTTP
 	isHTTP := false
 	httpMethods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT ", "TRACE "}
-	bufStr := string(buf[:n])
+	bufStr := string(fullBuf)
 	for _, method := range httpMethods {
 		if strings.HasPrefix(bufStr, method) {
 			isHTTP = true
@@ -116,10 +136,10 @@ func handleConnection(conn net.Conn, proxy *ProxyServer) {
 	
 	if isHTTP {
 		// Handle as HTTP - we need to wrap the connection with the already-read bytes
-		handleHTTPConnection(conn, buf[:n], proxy)
+		handleHTTPConnection(conn, fullBuf, proxy)
 	} else {
-		// Handle as MTProto
-		handleMTProtoConnectionWithBuffer(conn, buf[:n])
+		// Unknown protocol
+		conn.Close()
 	}
 }
 
@@ -184,8 +204,8 @@ func (w *connResponseWriter) Write(data []byte) (int, error) {
 	return w.conn.Write(data)
 }
 
-// printMTProtoConnectionInfo prints the Telegram connection details
-func printMTProtoConnectionInfo(port string) {
+// printSOCKS5ConnectionInfo prints the SOCKS5 connection details
+func printSOCKS5ConnectionInfo(port string) {
 	// Get Railway public domain
 	domain := os.Getenv("RAILWAY_PUBLIC_DOMAIN")
 	if domain == "" {
@@ -196,16 +216,27 @@ func printMTProtoConnectionInfo(port string) {
 	}
 	
 	log.Println("\n" + strings.Repeat("=", 80))
-	log.Printf("🔐 MTProto Secret: %s", mtprotoSecret)
+	log.Printf("🔐 SOCKS5 Username: %s", socks5Username)
+	log.Printf("🔐 SOCKS5 Password: %s", socks5Password)
 	
 	if domain != "" {
 		// Railway exposes services on port 443 externally via HTTPS
-		telegramURL := fmt.Sprintf("https://t.me/proxy?server=%s&port=443&secret=%s", domain, mtprotoSecret)
+		telegramURL := fmt.Sprintf("https://t.me/socks?server=%s&port=443&user=%s&pass=%s", 
+			domain, socks5Username, socks5Password)
 		log.Printf("📱 Telegram Connection URL: %s", telegramURL)
-		log.Println("\n✅ Server ready! Connect your Telegram client using the URL above.")
+		log.Println("\n✅ Telegram Setup Instructions:")
+		log.Println("   1. Open Telegram > Settings > Data and Storage > Proxy Settings")
+		log.Println("   2. Tap 'Add Proxy' or use the URL above")
+		log.Println("   3. If adding manually:")
+		log.Printf("      - Type: SOCKS5")
+		log.Printf("      - Server: %s", domain)
+		log.Printf("      - Port: 443")
+		log.Printf("      - Username: %s", socks5Username)
+		log.Printf("      - Password: %s", socks5Password)
 	} else {
 		log.Println("⚠️  Railway domain not detected. Set RAILWAY_PUBLIC_DOMAIN or RAILWAY_STATIC_URL")
-		log.Printf("📱 Telegram Connection Format: https://t.me/proxy?server=<your-domain>&port=443&secret=%s", mtprotoSecret)
+		log.Printf("📱 Telegram Connection Format: https://t.me/socks?server=<your-domain>&port=443&user=%s&pass=%s", 
+			socks5Username, socks5Password)
 	}
 	log.Println(strings.Repeat("=", 80) + "\n")
 }
@@ -467,122 +498,299 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
-// MTProto proxy implementation
-// Telegram datacenters - these are the servers MTProto proxy connects to
-var telegramDCs = []string{
-	"149.154.175.50:443",
-	"149.154.167.51:443",
-	"149.154.175.100:443",
-	"149.154.167.91:443",
-	"149.154.171.5:443",
-}
+// SOCKS5 Protocol Implementation (RFC 1928)
 
-// obfuscateData applies XOR obfuscation to data using the secret key
-func obfuscateData(data []byte, secretBytes []byte) {
-	for i := 0; i < len(data); i++ {
-		data[i] ^= secretBytes[i%len(secretBytes)]
-	}
-}
+// SOCKS5 constants
+const (
+	socks5Version byte = 0x05
+	
+	// Authentication methods
+	socks5AuthNone     byte = 0x00
+	socks5AuthPassword byte = 0x02
+	socks5AuthNoAccept byte = 0xFF
+	
+	// Commands
+	socks5CmdConnect byte = 0x01
+	
+	// Address types
+	socks5AddrIPv4   byte = 0x01
+	socks5AddrDomain byte = 0x03
+	socks5AddrIPv6   byte = 0x04
+	
+	// Reply codes
+	socks5ReplySuccess              byte = 0x00
+	socks5ReplyGeneralFailure       byte = 0x01
+	socks5ReplyConnectionNotAllowed byte = 0x02
+	socks5ReplyNetworkUnreachable   byte = 0x03
+	socks5ReplyHostUnreachable      byte = 0x04
+	socks5ReplyConnectionRefused    byte = 0x05
+	socks5ReplyTTLExpired           byte = 0x06
+	socks5ReplyCmdNotSupported      byte = 0x07
+	socks5ReplyAddrNotSupported     byte = 0x08
+)
 
-// handleMTProtoConnectionWithBuffer handles MTProto connection with initial buffered data
-func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) {
-	defer clientConn.Close()
+// handleSOCKS5Connection handles SOCKS5 protocol connection
+func handleSOCKS5Connection(conn net.Conn, initialData []byte, proxy *ProxyServer) {
+	defer conn.Close()
 	
 	atomic.AddInt64(&activeConnections, 1)
 	defer atomic.AddInt64(&activeConnections, -1)
 	
-	// Read the rest of the handshake (first 64 bytes contain protocol info)
-	handshake := make([]byte, 64)
-	copy(handshake, initialData)
+	// Step 1: Read the rest of the greeting (version byte already read)
+	// Format: [version=0x05] [nmethods] [methods...]
+	buf := make([]byte, 257)
+	copy(buf, initialData) // Copy the version byte we already read
 	
-	remaining := 64 - len(initialData)
-	if remaining > 0 {
-		n, err := io.ReadFull(clientConn, handshake[len(initialData):])
-		if err != nil || n != remaining {
-			log.Printf("[MTProto] Failed to read handshake: %v", err)
+	// Read nmethods
+	n, err := conn.Read(buf[1:2])
+	if err != nil || n != 1 {
+		log.Printf("[SOCKS5] Failed to read nmethods: %v", err)
+		return
+	}
+	
+	nmethods := int(buf[1])
+	if nmethods < 1 {
+		log.Printf("[SOCKS5] Invalid nmethods: %d", nmethods)
+		return
+	}
+	
+	// Read methods
+	n, err = io.ReadFull(conn, buf[2:2+nmethods])
+	if err != nil {
+		log.Printf("[SOCKS5] Failed to read methods: %v", err)
+		return
+	}
+	
+	// Step 2: Select authentication method
+	// If proxy has username/password, require auth, otherwise no auth
+	selectedMethod := socks5AuthNoAccept
+	if proxy.username != "" && proxy.password != "" {
+		// Check if client supports password auth
+		for i := 0; i < nmethods; i++ {
+			if buf[2+i] == socks5AuthPassword {
+				selectedMethod = socks5AuthPassword
+				break
+			}
+		}
+	} else {
+		// No authentication required
+		for i := 0; i < nmethods; i++ {
+			if buf[2+i] == socks5AuthNone {
+				selectedMethod = socks5AuthNone
+				break
+			}
+		}
+	}
+	
+	if selectedMethod == socks5AuthNoAccept {
+		conn.Write([]byte{socks5Version, socks5AuthNoAccept})
+		log.Printf("[SOCKS5] No acceptable authentication method")
+		return
+	}
+	
+	// Send method selection
+	if _, err := conn.Write([]byte{socks5Version, selectedMethod}); err != nil {
+		log.Printf("[SOCKS5] Failed to send method selection: %v", err)
+		return
+	}
+	
+	// Step 3: Handle authentication if required
+	if selectedMethod == socks5AuthPassword {
+		if !handleSOCKS5Auth(conn, proxy) {
 			return
 		}
 	}
 	
-	// Decode the handshake with our secret
-	secretBytes, err := hex.DecodeString(mtprotoSecret)
+	// Step 4: Read connection request
+	// Format: [version] [cmd] [rsv=0x00] [atyp] [dst.addr] [dst.port]
+	n, err = io.ReadFull(conn, buf[:4])
 	if err != nil {
-		log.Printf("[MTProto] Failed to decode secret: %v", err)
+		log.Printf("[SOCKS5] Failed to read request header: %v", err)
 		return
 	}
 	
-	// Apply obfuscation to handshake to decode it from the client
-	obfuscateData(handshake, secretBytes)
-	
-	// Try to connect to Telegram DC (use the first one as default)
-	dcConn, err := net.DialTimeout("tcp", telegramDCs[0], 30*time.Second)
-	if err != nil {
-		log.Printf("[MTProto] Failed to connect to Telegram DC: %v", err)
-		return
-	}
-	defer dcConn.Close()
-	
-	// Send decoded handshake to Telegram (no re-encoding needed)
-	if _, err := dcConn.Write(handshake); err != nil {
-		log.Printf("[MTProto] Failed to send handshake to DC: %v", err)
+	if buf[0] != socks5Version {
+		log.Printf("[SOCKS5] Invalid version in request: %d", buf[0])
 		return
 	}
 	
-	log.Printf("[MTProto] Connection established [Instance: %s]", instanceID)
+	cmd := buf[1]
+	// buf[2] is reserved
+	atyp := buf[3]
 	
-	// Bidirectional copy with obfuscation
-	// Use channels to coordinate goroutine cleanup
-	errChan := make(chan error, 2)
+	// Only support CONNECT command
+	if cmd != socks5CmdConnect {
+		sendSOCKS5Reply(conn, socks5ReplyCmdNotSupported, net.IPv4zero, 0)
+		log.Printf("[SOCKS5] Unsupported command: %d", cmd)
+		return
+	}
 	
-	// Client -> DC
-	go func() {
-		buffer := make([]byte, 32768)
-		for {
-			n, err := clientConn.Read(buffer)
-			if err != nil {
-				errChan <- err
-				return
-			}
-			
-			// Apply obfuscation
-			data := make([]byte, n)
-			copy(data, buffer[:n])
-			obfuscateData(data, secretBytes)
-			
-			if _, err := dcConn.Write(data); err != nil {
-				errChan <- err
-				return
-			}
+	// Step 5: Read destination address
+	var host string
+	switch atyp {
+	case socks5AddrIPv4:
+		n, err = io.ReadFull(conn, buf[:4])
+		if err != nil {
+			sendSOCKS5Reply(conn, socks5ReplyGeneralFailure, net.IPv4zero, 0)
+			return
 		}
+		host = net.IP(buf[:4]).String()
+		
+	case socks5AddrDomain:
+		n, err = io.ReadFull(conn, buf[:1])
+		if err != nil {
+			sendSOCKS5Reply(conn, socks5ReplyGeneralFailure, net.IPv4zero, 0)
+			return
+		}
+		domainLen := int(buf[0])
+		n, err = io.ReadFull(conn, buf[:domainLen])
+		if err != nil {
+			sendSOCKS5Reply(conn, socks5ReplyGeneralFailure, net.IPv4zero, 0)
+			return
+		}
+		host = string(buf[:domainLen])
+		
+	case socks5AddrIPv6:
+		n, err = io.ReadFull(conn, buf[:16])
+		if err != nil {
+			sendSOCKS5Reply(conn, socks5ReplyGeneralFailure, net.IPv4zero, 0)
+			return
+		}
+		host = net.IP(buf[:16]).String()
+		
+	default:
+		sendSOCKS5Reply(conn, socks5ReplyAddrNotSupported, net.IPv4zero, 0)
+		log.Printf("[SOCKS5] Unsupported address type: %d", atyp)
+		return
+	}
+	
+	// Read port
+	n, err = io.ReadFull(conn, buf[:2])
+	if err != nil {
+		sendSOCKS5Reply(conn, socks5ReplyGeneralFailure, net.IPv4zero, 0)
+		return
+	}
+	port := int(buf[0])<<8 | int(buf[1])
+	
+	// Step 6: Connect to target
+	target := fmt.Sprintf("%s:%d", host, port)
+	log.Printf("[SOCKS5] [%s] Connecting to %s", instanceID, target)
+	
+	targetConn, err := net.DialTimeout("tcp", target, 30*time.Second)
+	if err != nil {
+		log.Printf("[SOCKS5] [%s] Failed to connect to %s: %v", instanceID, target, err)
+		replyCode := socks5ReplyHostUnreachable
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			replyCode = socks5ReplyTTLExpired
+		}
+		sendSOCKS5Reply(conn, replyCode, net.IPv4zero, 0)
+		return
+	}
+	defer targetConn.Close()
+	
+	// Send success reply
+	localAddr := targetConn.LocalAddr().(*net.TCPAddr)
+	sendSOCKS5Reply(conn, socks5ReplySuccess, localAddr.IP, localAddr.Port)
+	
+	log.Printf("[SOCKS5] [%s] Connection established to %s", instanceID, target)
+	
+	// Step 7: Relay traffic bidirectionally
+	done := make(chan bool, 2)
+	
+	go func() {
+		io.Copy(targetConn, conn)
+		done <- true
 	}()
 	
-	// DC -> Client
 	go func() {
-		buffer := make([]byte, 32768)
-		for {
-			n, err := dcConn.Read(buffer)
-			if err != nil {
-				errChan <- err
-				return
-			}
-			
-			// Apply obfuscation
-			data := make([]byte, n)
-			copy(data, buffer[:n])
-			obfuscateData(data, secretBytes)
-			
-			if _, err := clientConn.Write(data); err != nil {
-				errChan <- err
-				return
-			}
-		}
+		io.Copy(conn, targetConn)
+		done <- true
 	}()
 	
-	// Wait for first error (one direction closing)
-	<-errChan
-	// Connection close in defer will terminate the other goroutine
-	// Wait for second goroutine to exit
-	<-errChan
+	<-done
+	log.Printf("[SOCKS5] [%s] Connection closed to %s", instanceID, target)
+}
+
+// handleSOCKS5Auth handles SOCKS5 username/password authentication
+func handleSOCKS5Auth(conn net.Conn, proxy *ProxyServer) bool {
+	// Format: [version=0x01] [ulen] [username] [plen] [password]
+	buf := make([]byte, 513)
 	
-	log.Printf("[MTProto] Connection closed [Instance: %s]", instanceID)
+	// Read version and username length
+	n, err := io.ReadFull(conn, buf[:2])
+	if err != nil || n != 2 {
+		log.Printf("[SOCKS5] Failed to read auth version: %v", err)
+		return false
+	}
+	
+	if buf[0] != 0x01 {
+		log.Printf("[SOCKS5] Invalid auth version: %d", buf[0])
+		return false
+	}
+	
+	ulen := int(buf[1])
+	if ulen < 1 {
+		conn.Write([]byte{0x01, 0x01}) // Auth failed
+		return false
+	}
+	
+	// Read username
+	n, err = io.ReadFull(conn, buf[:ulen])
+	if err != nil {
+		log.Printf("[SOCKS5] Failed to read username: %v", err)
+		return false
+	}
+	username := string(buf[:ulen])
+	
+	// Read password length
+	n, err = io.ReadFull(conn, buf[:1])
+	if err != nil {
+		log.Printf("[SOCKS5] Failed to read password length: %v", err)
+		return false
+	}
+	plen := int(buf[0])
+	
+	// Read password
+	n, err = io.ReadFull(conn, buf[:plen])
+	if err != nil {
+		log.Printf("[SOCKS5] Failed to read password: %v", err)
+		return false
+	}
+	password := string(buf[:plen])
+	
+	// Verify credentials
+	if username == proxy.username && password == proxy.password {
+		conn.Write([]byte{0x01, 0x00}) // Auth success
+		return true
+	}
+	
+	log.Printf("[SOCKS5] Authentication failed for user: %s", username)
+	conn.Write([]byte{0x01, 0x01}) // Auth failed
+	return false
+}
+
+// sendSOCKS5Reply sends a SOCKS5 reply message
+func sendSOCKS5Reply(conn net.Conn, reply byte, ip net.IP, port int) {
+	// Format: [version] [reply] [rsv=0x00] [atyp] [bind.addr] [bind.port]
+	resp := make([]byte, 4)
+	resp[0] = socks5Version
+	resp[1] = reply
+	resp[2] = 0x00 // Reserved
+	
+	// Determine address type and format
+	if ip4 := ip.To4(); ip4 != nil {
+		resp[3] = socks5AddrIPv4
+		resp = append(resp, ip4...)
+	} else if ip6 := ip.To16(); ip6 != nil {
+		resp[3] = socks5AddrIPv6
+		resp = append(resp, ip6...)
+	} else {
+		resp[3] = socks5AddrIPv4
+		resp = append(resp, net.IPv4zero...)
+	}
+	
+	// Add port
+	resp = append(resp, byte(port>>8), byte(port&0xFF))
+	
+	conn.Write(resp)
 }
