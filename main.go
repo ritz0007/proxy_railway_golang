@@ -190,6 +190,9 @@ func printMTProtoConnectionInfo(port string) {
 	domain := os.Getenv("RAILWAY_PUBLIC_DOMAIN")
 	if domain == "" {
 		domain = os.Getenv("RAILWAY_STATIC_URL")
+		// Strip protocol if present (RAILWAY_STATIC_URL may include https://)
+		domain = strings.TrimPrefix(domain, "https://")
+		domain = strings.TrimPrefix(domain, "http://")
 	}
 	
 	log.Println("\n" + strings.Repeat("=", 80))
@@ -474,6 +477,13 @@ var telegramDCs = []string{
 	"149.154.171.5:443",
 }
 
+// obfuscateData applies XOR obfuscation to data using the secret key
+func obfuscateData(data []byte, secretBytes []byte) {
+	for i := 0; i < len(data) && i < len(secretBytes); i++ {
+		data[i] ^= secretBytes[i%len(secretBytes)]
+	}
+}
+
 // handleMTProtoConnectionWithBuffer handles MTProto connection with initial buffered data
 func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) {
 	defer clientConn.Close()
@@ -502,9 +512,7 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 	}
 	
 	// Apply obfuscation to handshake
-	for i := 0; i < 64 && i < len(secretBytes); i++ {
-		handshake[i] ^= secretBytes[i%len(secretBytes)]
-	}
+	obfuscateData(handshake, secretBytes)
 	
 	// Try to connect to Telegram DC (use the first one as default)
 	dcConn, err := net.DialTimeout("tcp", telegramDCs[0], 30*time.Second)
@@ -515,9 +523,7 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 	defer dcConn.Close()
 	
 	// Re-encode handshake for Telegram DC
-	for i := 0; i < 64 && i < len(secretBytes); i++ {
-		handshake[i] ^= secretBytes[i%len(secretBytes)]
-	}
+	obfuscateData(handshake, secretBytes)
 	
 	// Send handshake to Telegram
 	if _, err := dcConn.Write(handshake); err != nil {
@@ -542,9 +548,7 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 			// Apply obfuscation
 			data := make([]byte, n)
 			copy(data, buffer[:n])
-			for i := 0; i < n && i < len(secretBytes); i++ {
-				data[i] ^= secretBytes[i%len(secretBytes)]
-			}
+			obfuscateData(data, secretBytes)
 			
 			if _, err := dcConn.Write(data); err != nil {
 				break
@@ -565,108 +569,7 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 			// Apply obfuscation
 			data := make([]byte, n)
 			copy(data, buffer[:n])
-			for i := 0; i < n && i < len(secretBytes); i++ {
-				data[i] ^= secretBytes[i%len(secretBytes)]
-			}
-			
-			if _, err := clientConn.Write(data); err != nil {
-				break
-			}
-		}
-		done <- true
-	}()
-	
-	<-done
-	log.Printf("[MTProto] Connection closed [Instance: %s]", instanceID)
-}
-
-// handleMTProtoConnection handles an MTProto proxy connection
-func handleMTProtoConnection(clientConn net.Conn) {
-	defer clientConn.Close()
-	
-	atomic.AddInt64(&activeConnections, 1)
-	defer atomic.AddInt64(&activeConnections, -1)
-	
-	// Read the handshake (first 64 bytes contain protocol info)
-	handshake := make([]byte, 64)
-	n, err := io.ReadFull(clientConn, handshake)
-	if err != nil || n != 64 {
-		log.Printf("[MTProto] Failed to read handshake: %v", err)
-		return
-	}
-	
-	// Decode the handshake with our secret
-	secretBytes, err := hex.DecodeString(mtprotoSecret)
-	if err != nil {
-		log.Printf("[MTProto] Failed to decode secret: %v", err)
-		return
-	}
-	for i := 0; i < 64 && i < len(secretBytes); i++ {
-		handshake[i] ^= secretBytes[i%len(secretBytes)]
-	}
-	
-	// Try to connect to Telegram DC (use the first one as default)
-	dcConn, err := net.DialTimeout("tcp", telegramDCs[0], 30*time.Second)
-	if err != nil {
-		log.Printf("[MTProto] Failed to connect to Telegram DC: %v", err)
-		return
-	}
-	defer dcConn.Close()
-	
-	// Re-encode handshake for Telegram DC
-	for i := 0; i < 64 && i < len(secretBytes); i++ {
-		handshake[i] ^= secretBytes[i%len(secretBytes)]
-	}
-	
-	// Send handshake to Telegram
-	if _, err := dcConn.Write(handshake); err != nil {
-		log.Printf("[MTProto] Failed to send handshake to DC: %v", err)
-		return
-	}
-	
-	log.Printf("[MTProto] Connection established [Instance: %s]", instanceID)
-	
-	// Bidirectional copy with obfuscation
-	done := make(chan bool, 2)
-	
-	// Client -> DC
-	go func() {
-		buffer := make([]byte, 32768)
-		for {
-			n, err := clientConn.Read(buffer)
-			if err != nil {
-				break
-			}
-			
-			// Apply obfuscation
-			data := make([]byte, n)
-			copy(data, buffer[:n])
-			for i := 0; i < n && i < len(secretBytes); i++ {
-				data[i] ^= secretBytes[i%len(secretBytes)]
-			}
-			
-			if _, err := dcConn.Write(data); err != nil {
-				break
-			}
-		}
-		done <- true
-	}()
-	
-	// DC -> Client
-	go func() {
-		buffer := make([]byte, 32768)
-		for {
-			n, err := dcConn.Read(buffer)
-			if err != nil {
-				break
-			}
-			
-			// Apply obfuscation
-			data := make([]byte, n)
-			copy(data, buffer[:n])
-			for i := 0; i < n && i < len(secretBytes); i++ {
-				data[i] ^= secretBytes[i%len(secretBytes)]
-			}
+			obfuscateData(data, secretBytes)
 			
 			if _, err := clientConn.Write(data); err != nil {
 				break
