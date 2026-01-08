@@ -105,7 +105,7 @@ func handleConnection(conn net.Conn, proxy *ProxyServer) {
 	
 	// Check if it looks like HTTP
 	isHTTP := false
-	httpMethods := []string{"GET ", "POST", "PUT ", "DELE", "HEAD", "OPTI", "PATC", "CONN", "TRAC"}
+	httpMethods := []string{"GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS", "PATCH", "CONNECT", "TRACE"}
 	bufStr := string(buf[:n])
 	for _, method := range httpMethods {
 		if strings.HasPrefix(bufStr, method) {
@@ -479,7 +479,7 @@ var telegramDCs = []string{
 
 // obfuscateData applies XOR obfuscation to data using the secret key
 func obfuscateData(data []byte, secretBytes []byte) {
-	for i := 0; i < len(data) && i < len(secretBytes); i++ {
+	for i := 0; i < len(data); i++ {
 		data[i] ^= secretBytes[i%len(secretBytes)]
 	}
 }
@@ -511,7 +511,7 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 		return
 	}
 	
-	// Apply obfuscation to handshake
+	// Apply obfuscation to handshake to decode it from the client
 	obfuscateData(handshake, secretBytes)
 	
 	// Try to connect to Telegram DC (use the first one as default)
@@ -522,10 +522,7 @@ func handleMTProtoConnectionWithBuffer(clientConn net.Conn, initialData []byte) 
 	}
 	defer dcConn.Close()
 	
-	// Re-encode handshake for Telegram DC
-	obfuscateData(handshake, secretBytes)
-	
-	// Send handshake to Telegram
+	// Send decoded handshake to Telegram (no re-encoding needed)
 	if _, err := dcConn.Write(handshake); err != nil {
 		log.Printf("[MTProto] Failed to send handshake to DC: %v", err)
 		return
