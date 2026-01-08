@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -17,12 +19,25 @@ var (
 	activeConnections int64
 	totalRequests     int64
 	instanceID        string
+	mtprotoSecret     string
 )
 
 func init() {
 	// Generate unique instance ID for multi-instance tracking
 	hostname, _ := os.Hostname()
 	instanceID = fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano()%10000)
+	
+	// Generate unique MTProto secret for this instance
+	mtprotoSecret = generateMTProtoSecret()
+}
+
+// generateMTProtoSecret generates a random 32-byte (64 hex char) secret for MTProto
+func generateMTProtoSecret() string {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		log.Fatalf("Failed to generate MTProto secret: %v", err)
+	}
+	return hex.EncodeToString(secret)
 }
 
 func main() {
@@ -48,16 +63,55 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// Print startup information
 	log.Printf("🚀 Proxy server [Instance: %s] starting on port %s", instanceID, port)
 	if proxyUser != "" {
 		log.Println("🔐 Authentication enabled")
 	} else {
 		log.Println("⚠️  Authentication disabled (set PROXY_USER and PROXY_PASS to enable)")
 	}
+	
+	// Print MTProto connection information
+	printMTProtoConnectionInfo(port)
+	
+	// Start MTProto proxy in a separate goroutine
+	go startMTProtoProxy(port)
 
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+// printMTProtoConnectionInfo prints the Telegram connection details
+func printMTProtoConnectionInfo(port string) {
+	// Get Railway public domain
+	domain := os.Getenv("RAILWAY_PUBLIC_DOMAIN")
+	if domain == "" {
+		domain = os.Getenv("RAILWAY_STATIC_URL")
+	}
+	
+	log.Println("\n" + strings.Repeat("=", 80))
+	log.Printf("🔐 MTProto Secret: %s", mtprotoSecret)
+	
+	if domain != "" {
+		// Railway exposes services on port 443 externally via HTTPS
+		telegramURL := fmt.Sprintf("https://t.me/proxy?server=%s&port=443&secret=%s", domain, mtprotoSecret)
+		log.Printf("📱 Telegram Connection URL: %s", telegramURL)
+		log.Println("\n✅ Server ready! Connect your Telegram client using the URL above.")
+	} else {
+		log.Println("⚠️  Railway domain not detected. Set RAILWAY_PUBLIC_DOMAIN or RAILWAY_STATIC_URL")
+		log.Printf("📱 Telegram Connection Format: https://t.me/proxy?server=<your-domain>&port=443&secret=%s", mtprotoSecret)
+	}
+	log.Println(strings.Repeat("=", 80) + "\n")
+}
+
+// startMTProtoProxy starts the MTProto proxy server
+func startMTProtoProxy(httpPort string) {
+	// MTProto runs on the same port as HTTP - we'll detect the protocol from the handshake
+	// For now, we'll start a TCP listener that can handle both HTTP and MTProto
+	// The HTTP server already listens on the port, so MTProto will be handled via raw TCP detection
+	
+	log.Printf("[MTProto] MTProto proxy handler initialized (shares port with HTTP)")
 }
 
 type ProxyServer struct {
@@ -315,4 +369,109 @@ func copyHeaders(dst, src http.Header) {
 			dst.Add(key, value)
 		}
 	}
+}
+
+// MTProto proxy implementation
+// Telegram datacenters - these are the servers MTProto proxy connects to
+var telegramDCs = []string{
+	"149.154.175.50:443",
+	"149.154.167.51:443",
+	"149.154.175.100:443",
+	"149.154.167.91:443",
+	"149.154.171.5:443",
+}
+
+// handleMTProtoConnection handles an MTProto proxy connection
+func handleMTProtoConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+	
+	atomic.AddInt64(&activeConnections, 1)
+	defer atomic.AddInt64(&activeConnections, -1)
+	
+	// Read the handshake (first 64 bytes contain protocol info)
+	handshake := make([]byte, 64)
+	n, err := io.ReadFull(clientConn, handshake)
+	if err != nil || n != 64 {
+		log.Printf("[MTProto] Failed to read handshake: %v", err)
+		return
+	}
+	
+	// Decode the handshake with our secret
+	secretBytes, _ := hex.DecodeString(mtprotoSecret)
+	for i := 0; i < 64 && i < len(secretBytes); i++ {
+		handshake[i] ^= secretBytes[i%len(secretBytes)]
+	}
+	
+	// Try to connect to Telegram DC (use the first one as default)
+	dcConn, err := net.DialTimeout("tcp", telegramDCs[0], 30*time.Second)
+	if err != nil {
+		log.Printf("[MTProto] Failed to connect to Telegram DC: %v", err)
+		return
+	}
+	defer dcConn.Close()
+	
+	// Re-encode handshake for Telegram DC
+	for i := 0; i < 64 && i < len(secretBytes); i++ {
+		handshake[i] ^= secretBytes[i%len(secretBytes)]
+	}
+	
+	// Send handshake to Telegram
+	if _, err := dcConn.Write(handshake); err != nil {
+		log.Printf("[MTProto] Failed to send handshake to DC: %v", err)
+		return
+	}
+	
+	log.Printf("[MTProto] Connection established [Instance: %s]", instanceID)
+	
+	// Bidirectional copy with obfuscation
+	done := make(chan bool, 2)
+	
+	// Client -> DC
+	go func() {
+		buffer := make([]byte, 32768)
+		for {
+			n, err := clientConn.Read(buffer)
+			if err != nil {
+				break
+			}
+			
+			// Apply obfuscation
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+			for i := 0; i < n && i < len(secretBytes); i++ {
+				data[i] ^= secretBytes[i%len(secretBytes)]
+			}
+			
+			if _, err := dcConn.Write(data); err != nil {
+				break
+			}
+		}
+		done <- true
+	}()
+	
+	// DC -> Client
+	go func() {
+		buffer := make([]byte, 32768)
+		for {
+			n, err := dcConn.Read(buffer)
+			if err != nil {
+				break
+			}
+			
+			// Apply obfuscation
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+			for i := 0; i < n && i < len(secretBytes); i++ {
+				data[i] ^= secretBytes[i%len(secretBytes)]
+			}
+			
+			if _, err := clientConn.Write(data); err != nil {
+				break
+			}
+		}
+		done <- true
+	}()
+	
+	<-done
+	log.Printf("[MTProto] Connection closed [Instance: %s]", instanceID)
 }

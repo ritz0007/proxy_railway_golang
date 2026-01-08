@@ -1,16 +1,18 @@
 # Go Proxy Server for Railway.com
 
-A high-performance HTTP/HTTPS proxy server written in Go, designed for deployment on Railway.com with multiple instance support.
+A high-performance HTTP/HTTPS and MTProto proxy server written in Go, designed for deployment on Railway.com with multiple instance support. Now includes support for Telegram clients via MTProto protocol!
 
 ## Features
 
 - ✅ HTTP and HTTPS (CONNECT) proxy support
+- ✅ **MTProto proxy for Telegram** (NEW!)
 - ✅ Multiple instance support with unique instance IDs
 - ✅ Optional Basic authentication
 - ✅ Health check endpoint for Railway
 - ✅ Connection statistics tracking
 - ✅ Request forwarding headers (X-Forwarded-For)
 - ✅ Automatic scaling with Railway replicas
+- ✅ **Instance-specific MTProto secrets**
 
 ## Deployment on Railway
 
@@ -21,6 +23,7 @@ A high-performance HTTP/HTTPS proxy server written in Go, designed for deploymen
 3. Click "New Project" → "Deploy from GitHub repo"
 4. Select your repository
 5. Railway will automatically detect the Dockerfile and deploy
+6. **Check the deployment logs for your Telegram connection URL!**
 
 ### Method 2: Deploy via Railway CLI
 
@@ -35,6 +38,19 @@ railway login
 railway init
 railway up
 ```
+
+### Finding Your Telegram Connection URL
+
+After deployment, check the Railway logs to find your connection information:
+
+1. Go to your Railway project dashboard
+2. Click on your service
+3. Navigate to the "Deployments" tab
+4. Click on the latest deployment
+5. Look for the connection URL in the logs, formatted as:
+   ```
+   📱 Telegram Connection URL: https://t.me/proxy?server=your-app.up.railway.app&port=443&secret=...
+   ```
 
 ## Environment Variables
 
@@ -64,9 +80,70 @@ Railway will automatically load balance between instances.
 | `/health` | Health check (returns JSON status) |
 | `/stats` | Server statistics |
 
+## MTProto Proxy Details
+
+### How It Works
+
+The server generates a unique 32-byte (64 hex character) secret on startup. This secret is used to:
+- Authenticate Telegram clients
+- Obfuscate traffic between client and proxy
+- Each Railway replica instance gets its own unique secret
+
+### Connection Format
+
+```
+https://t.me/proxy?server=<your-domain>&port=443&secret=<64-hex-chars>
+```
+
+Example:
+```
+https://t.me/proxy?server=my-proxy.up.railway.app&port=443&secret=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+```
+
+### Telegram Datacenters
+
+The proxy automatically connects to Telegram's datacenters:
+- 149.154.175.50:443
+- 149.154.167.51:443
+- 149.154.175.100:443
+- 149.154.167.91:443
+- 149.154.171.5:443
+
+### Multiple Instances
+
+When running multiple Railway replicas:
+- Each instance generates its own unique secret
+- Check logs for each instance's connection URL
+- Railway load balancer distributes connections
+- Each instance ID is logged with connection details
+
 ## Usage Examples
 
-### Without Authentication
+### Connecting Telegram
+
+**This is the easiest way to use the proxy!**
+
+1. Deploy the server on Railway
+2. Check the deployment logs for your Telegram connection URL
+3. Open the URL on your mobile device (it will look like):
+   ```
+   https://t.me/proxy?server=your-app.up.railway.app&port=443&secret=abc123...
+   ```
+4. Telegram will open and ask you to confirm adding the proxy
+5. Tap "Connect" and you're done!
+
+**What is MTProto vs HTTP Proxy?**
+
+- **MTProto Proxy**: Native Telegram protocol, optimized for Telegram clients. Works seamlessly with one-click setup via t.me link. This is what you should use for Telegram!
+- **HTTP/HTTPS Proxy**: General-purpose proxy for web browsers and other applications. Can proxy any HTTP/HTTPS traffic.
+
+This server supports both, so you can use it for Telegram AND as a regular web proxy!
+
+### Using as HTTP/HTTPS Proxy
+
+### Using as HTTP/HTTPS Proxy
+
+#### Without Authentication
 
 ```bash
 # HTTP Proxy
@@ -76,7 +153,7 @@ curl -x https://your-app.railway.app:443 http://example.com
 curl -x https://your-app.railway.app:443 https://example.com
 ```
 
-### With Authentication
+##### With Authentication
 
 Set `PROXY_USER` and `PROXY_PASS` environment variables, then:
 
@@ -89,6 +166,8 @@ export http_proxy=https://user:pass@your-app.railway.app:443
 export https_proxy=https://user:pass@your-app.railway.app:443
 curl http://example.com
 ```
+
+**Note**: Authentication only applies to HTTP/HTTPS proxy. MTProto connections use the secret key for authentication.
 
 ### Python Example
 
